@@ -143,16 +143,23 @@ public static class AudioDetector
 # ══════════════════════════════════════════════════════════════
 # SCRIPT STATE — All mutable state tracked at script scope
 # ══════════════════════════════════════════════════════════════
-$script:SettingsPath   = Join-Path $PSScriptRoot 'settings.json'
+# Resolve the script's directory — works for both .ps1 and ps2exe .exe
+$script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot }
+    elseif ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) {
+        [System.IO.Path]::GetDirectoryName([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+    } else { [System.IO.Directory]::GetCurrentDirectory() }
+
+$script:SettingsPath   = Join-Path $script:ScriptDir 'settings.json'
 $script:Settings       = $null
 $script:LastBreakTime  = [DateTime]::Now          # Timestamp of last break/reset
 $script:State          = 'Tracking'                # Tracking | Deferred | Buffering | Snoozed
-$script:SnoozeCount    = 0                         # Snoozes used this break cycle (max 1)
+$script:SnoozeCount    = 0                         # Snoozes used this break cycle (configurable max)
 $script:SnoozedAt      = $null                     # Timestamp when snooze started
 $script:MeetingEndedAt = $null                     # Timestamp when meeting ended (for buffer)
 $script:ScreenLocked   = $false                    # True while screen is locked
 $script:ScreenLockedAt = $null                     # Timestamp when screen was locked
 $script:Paused         = $false                    # User paused tracking
+$script:PausedElapsed  = $null                     # Sitting minutes elapsed when paused
 $script:OverlayShowing = $false                    # Guard against overlapping dialogs
 $script:TrayIcon       = $null                     # System tray NotifyIcon
 $script:App            = $null                     # WPF Application instance
@@ -165,6 +172,517 @@ $script:OnBreak             = $false               # True while break countdown 
 $script:BreakEndTime        = $null                # When the current break countdown ends
 $script:BreakPaused         = $false               # True when idle-gated break is paused (user active; used by countdown timer closure)
 $script:BreakRemaining      = 0                    # Seconds remaining in break (used by countdown timer closure)
+$script:WaitingForActivity  = $false               # True after break/reset — timer won't start until input detected
+
+# Analytics — event logging and report generation
+$script:LogDir              = Join-Path $script:ScriptDir 'logs'
+$script:ReportsDir          = Join-Path $script:ScriptDir 'reports'
+$script:LastReportDate      = $null                 # Tracks last day a daily report was generated
+
+# ══════════════════════════════════════════════════════════════
+# EVENT LOGGING — Append timestamped events to daily JSON files
+# ══════════════════════════════════════════════════════════════
+function Write-BreakTimeEvent {
+    param(
+        [string]$EventType,
+        [hashtable]$Data = @{}
+    )
+    try {
+        if (-not (Test-Path $script:LogDir)) { New-Item -Path $script:LogDir -ItemType Directory -Force | Out-Null }
+        $dateStr = (Get-Date).ToString('yyyy-MM-dd')
+        $logFile = Join-Path $script:LogDir "$dateStr.json"
+
+        $entry = @{
+            Timestamp = (Get-Date).ToString('o')
+            Event     = $EventType
+            SittingMinutes = [Math]::Round((Get-SittingMinutes), 1)
+        }
+        foreach ($k in $Data.Keys) { $entry[$k] = $Data[$k] }
+
+        $json = $entry | ConvertTo-Json -Compress
+        Add-Content -Path $logFile -Value $json -Encoding UTF8
+    } catch { }
+}
+
+function Get-DailyEvents {
+    param([string]$DateStr)  # 'yyyy-MM-dd'
+    $logFile = Join-Path $script:LogDir "$DateStr.json"
+    if (-not (Test-Path $logFile)) { return @() }
+    try {
+        $lines = Get-Content $logFile -Encoding UTF8 | Where-Object { $_.Trim() -ne '' }
+        return $lines | ForEach-Object { $_ | ConvertFrom-Json }
+    } catch { return @() }
+}
+
+# ══════════════════════════════════════════════════════════════
+# DAILY METRICS — Compute analytics from raw event log
+# ══════════════════════════════════════════════════════════════
+function Get-DailyMetrics {
+    param([string]$DateStr)
+    $events = Get-DailyEvents -DateStr $DateStr
+    if ($events.Count -eq 0) {
+        return @{
+            Date = $DateStr; HasData = $false
+            TotalPrompts = 0; BreaksTaken = 0; BreaksCompleted = 0; BreaksEndedEarly = 0
+            LockScreenBreaks = 0; TotalSnoozes = 0; TotalDismissals = 0; TotalResets = 0
+            MeetingDeferrals = 0; NaturalBreaks = 0; PauseCount = 0; ScreenLocks = 0
+            TotalBreakMinutes = 0; AvgSittingAtPrompt = 0; MaxSittingAtPrompt = 0
+            AvgSnoozesPerBreak = 0; BreakComplianceRate = 0; SnoozeRate = 0
+            HourlyPrompts = @{}; HourlyBreaks = @{}
+            HealthScore = 0
+        }
+    }
+
+    $prompted = @($events | Where-Object { $_.Event -eq 'BreakPrompted' })
+    $taken = @($events | Where-Object { $_.Event -eq 'BreakTaken' })
+    $completed = @($events | Where-Object { $_.Event -eq 'BreakCompleted' })
+    $endedEarly = @($events | Where-Object { $_.Event -eq 'BreakEndedEarly' })
+    $lockBreaks = @($events | Where-Object { $_.Event -eq 'LockScreenBreak' })
+    $snoozed = @($events | Where-Object { $_.Event -eq 'Snoozed' })
+    $dismissed = @($events | Where-Object { $_.Event -eq 'Dismissed' })
+    $resets = @($events | Where-Object { $_.Event -eq 'ResetTimer' })
+    $deferred = @($events | Where-Object { $_.Event -eq 'MeetingDeferred' })
+    $natural = @($events | Where-Object { $_.Event -eq 'NaturalBreak' })
+    $paused = @($events | Where-Object { $_.Event -eq 'Paused' })
+    $screenLocks = @($events | Where-Object { $_.Event -eq 'ScreenLocked' })
+
+    # Total breaks = explicit breaks + lock screen breaks + natural breaks
+    $totalBreaks = $taken.Count + $lockBreaks.Count + $natural.Count
+
+    # Break time from completed breaks
+    $totalBreakMin = 0
+    foreach ($evt in $completed) {
+        if ($null -ne $evt.BreakDurationSeconds) { $totalBreakMin += $evt.BreakDurationSeconds / 60 }
+    }
+    foreach ($evt in $endedEarly) {
+        if ($null -ne $evt.ElapsedSeconds) { $totalBreakMin += $evt.ElapsedSeconds / 60 }
+    }
+
+    # Sitting minutes at prompt time
+    $sittingAtPrompt = @($prompted | ForEach-Object { if ($null -ne $_.SittingMinutes) { $_.SittingMinutes } })
+    $avgSitting = if ($sittingAtPrompt.Count -gt 0) { ($sittingAtPrompt | Measure-Object -Average).Average } else { 0 }
+    $maxSitting = if ($sittingAtPrompt.Count -gt 0) { ($sittingAtPrompt | Measure-Object -Maximum).Maximum } else { 0 }
+
+    # Snooze rate
+    $snoozeRate = if ($prompted.Count -gt 0) { [Math]::Round($snoozed.Count / $prompted.Count * 100, 0) } else { 0 }
+
+    # Break compliance: breaks taken out of prompts
+    $complianceRate = if ($prompted.Count -gt 0) { [Math]::Round($totalBreaks / $prompted.Count * 100, 0) } else { 0 }
+    if ($complianceRate -gt 100) { $complianceRate = 100 }
+
+    # Average snoozes per break cycle (snoozes / total break prompts that resulted in a break)
+    $avgSnoozes = if ($totalBreaks -gt 0) { [Math]::Round($snoozed.Count / $totalBreaks, 1) } else { 0 }
+
+    # Hourly distribution
+    $hourlyPrompts = @{}
+    $hourlyBreaks = @{}
+    foreach ($evt in $prompted) {
+        $h = ([DateTime]::Parse($evt.Timestamp)).Hour.ToString()
+        if (-not $hourlyPrompts.ContainsKey($h)) { $hourlyPrompts[$h] = 0 }
+        $hourlyPrompts[$h]++
+    }
+    foreach ($evt in ($taken + $lockBreaks)) {
+        $h = ([DateTime]::Parse($evt.Timestamp)).Hour.ToString()
+        if (-not $hourlyBreaks.ContainsKey($h)) { $hourlyBreaks[$h] = 0 }
+        $hourlyBreaks[$h]++
+    }
+
+    # Health score
+    $healthScore = Get-HealthScore -ComplianceRate $complianceRate -SnoozeRate $snoozeRate `
+        -CompletedCount $completed.Count -TakenCount $taken.Count -MaxSitting $maxSitting `
+        -MeetingDeferrals $deferred.Count -ResetCount $resets.Count
+
+    return @{
+        Date = $DateStr; HasData = $true
+        TotalPrompts = $prompted.Count; BreaksTaken = $totalBreaks
+        BreaksCompleted = $completed.Count; BreaksEndedEarly = $endedEarly.Count
+        LockScreenBreaks = $lockBreaks.Count; TotalSnoozes = $snoozed.Count
+        TotalDismissals = $dismissed.Count; TotalResets = $resets.Count
+        MeetingDeferrals = $deferred.Count; NaturalBreaks = $natural.Count
+        PauseCount = $paused.Count; ScreenLocks = $screenLocks.Count
+        TotalBreakMinutes = [Math]::Round($totalBreakMin, 1)
+        AvgSittingAtPrompt = [Math]::Round($avgSitting, 0)
+        MaxSittingAtPrompt = [Math]::Round($maxSitting, 0)
+        AvgSnoozesPerBreak = $avgSnoozes
+        BreakComplianceRate = $complianceRate; SnoozeRate = $snoozeRate
+        HourlyPrompts = $hourlyPrompts; HourlyBreaks = $hourlyBreaks
+        HealthScore = $healthScore
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+# HEALTH SCORE — Weighted 0-100 composite score
+# ══════════════════════════════════════════════════════════════
+function Get-HealthScore {
+    param(
+        [double]$ComplianceRate, [double]$SnoozeRate,
+        [int]$CompletedCount, [int]$TakenCount,
+        [double]$MaxSitting, [int]$MeetingDeferrals, [int]$ResetCount
+    )
+    # Compliance (40%): direct percentage
+    $compScore = [Math]::Min($ComplianceRate, 100)
+
+    # Break quality (20%): completed vs taken (full breaks are better)
+    $qualityScore = if ($TakenCount -gt 0) { ($CompletedCount / $TakenCount) * 100 } else { 100 }
+
+    # Low snooze (20%): lower snooze rate = higher score
+    $snoozeScore = [Math]::Max(0, 100 - ($SnoozeRate * 1.5))
+
+    # Sitting discipline (15%): penalty for long streaks (>60 min is bad)
+    $sittingScore = if ($MaxSitting -le 50) { 100 } elseif ($MaxSitting -le 90) { 100 - (($MaxSitting - 50) * 2.5) } else { 0 }
+
+    # Reset penalty (5%): resets bypass the system
+    $resetScore = [Math]::Max(0, 100 - ($ResetCount * 25))
+
+    $weighted = ($compScore * 0.40) + ($qualityScore * 0.20) + ($snoozeScore * 0.20) + ($sittingScore * 0.15) + ($resetScore * 0.05)
+    return [Math]::Round([Math]::Min([Math]::Max($weighted, 0), 100), 0)
+}
+
+# ══════════════════════════════════════════════════════════════
+# HTML REPORT GENERATORS — Daily & Weekly styled reports
+# ══════════════════════════════════════════════════════════════
+
+function Get-HealthGrade {
+    param([int]$Score)
+    if ($Score -ge 90) { return @{ Grade = 'A'; Color = '#4CAF50'; Emoji = [char]::ConvertFromUtf32(0x1F31F) } }  # 🌟
+    if ($Score -ge 75) { return @{ Grade = 'B'; Color = '#8BC34A'; Emoji = [char]::ConvertFromUtf32(0x2705) } }   # ✅
+    if ($Score -ge 60) { return @{ Grade = 'C'; Color = '#FFC107'; Emoji = [char]::ConvertFromUtf32(0x26A0) } }   # ⚠
+    if ($Score -ge 40) { return @{ Grade = 'D'; Color = '#FF9800'; Emoji = [char]::ConvertFromUtf32(0x1F614) } }  # 😔
+    return @{ Grade = 'F'; Color = '#F44336'; Emoji = [char]::ConvertFromUtf32(0x1F6A8) } # 🚨
+}
+
+function Get-ReportCSS {
+    return @"
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    .container { max-width: 720px; margin: 0 auto; }
+    h1 { color: #00d4ff; font-size: 28px; margin-bottom: 4px; }
+    h2 { color: #00d4ff; font-size: 20px; margin: 24px 0 12px; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 20px; }
+    .score-card { background: #16213e; border-radius: 12px; padding: 24px; text-align: center; margin: 16px 0; }
+    .score-big { font-size: 64px; font-weight: bold; line-height: 1.1; }
+    .score-label { font-size: 14px; color: #888; margin-top: 4px; }
+    .grade-badge { display: inline-block; font-size: 18px; font-weight: bold; padding: 4px 16px; border-radius: 20px; margin-top: 8px; }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+    .metric-card { background: #16213e; border-radius: 10px; padding: 16px; }
+    .metric-value { font-size: 28px; font-weight: bold; color: #00d4ff; }
+    .metric-label { font-size: 12px; color: #888; margin-top: 2px; }
+    .timeline { background: #16213e; border-radius: 10px; padding: 16px; margin: 16px 0; }
+    .timeline-event { padding: 6px 0; border-bottom: 1px solid #222; font-size: 13px; display: flex; justify-content: space-between; }
+    .timeline-event:last-child { border-bottom: none; }
+    .timeline-time { color: #888; font-family: 'Consolas', monospace; min-width: 60px; }
+    .timeline-type { font-weight: 600; min-width: 140px; }
+    .event-BreakTaken, .event-BreakCompleted { color: #4CAF50; }
+    .event-Snoozed, .event-Dismissed { color: #FF9800; }
+    .event-BreakEndedEarly { color: #FFC107; }
+    .event-LockScreenBreak, .event-NaturalBreak { color: #8BC34A; }
+    .event-MeetingDeferred { color: #9C27B0; }
+    .event-ResetTimer { color: #F44336; }
+    .event-Paused { color: #FF5722; }
+    .event-Resumed, .event-AppStarted { color: #00BCD4; }
+    .event-ScreenLocked, .event-ScreenUnlocked { color: #607D8B; }
+    .bar-container { background: #0a0a1a; border-radius: 6px; height: 18px; margin: 4px 0; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 6px; transition: width 0.3s; }
+    .insights { background: #16213e; border-radius: 10px; padding: 16px; margin: 16px 0; }
+    .insight-item { padding: 6px 0; font-size: 14px; }
+    .insight-icon { margin-right: 6px; }
+    .footer { text-align: center; color: #555; font-size: 12px; margin-top: 24px; }
+    .week-day { background: #16213e; border-radius: 8px; padding: 12px; margin: 8px 0; display: flex; align-items: center; justify-content: space-between; }
+    .week-day-name { font-weight: 600; min-width: 90px; }
+    .week-day-score { font-size: 24px; font-weight: bold; min-width: 50px; text-align: center; }
+    .week-day-stats { font-size: 12px; color: #888; }
+</style>
+"@
+}
+
+function New-DailyReport {
+    param([string]$Date)
+    if (-not $Date) { $Date = (Get-Date).ToString('yyyy-MM-dd') }
+
+    $metrics = Get-DailyMetrics -Date $Date
+    if (-not $metrics -or $metrics.TotalPrompts -eq 0) { return $null }
+
+    $healthScore = Get-HealthScore -ComplianceRate $metrics.ComplianceRate -SnoozeRate $metrics.SnoozeRate `
+        -CompletedCount $metrics.BreaksCompleted -TakenCount $metrics.BreaksTaken `
+        -MaxSitting $metrics.MaxSittingStreak -MeetingDeferrals $metrics.MeetingDeferrals -ResetCount $metrics.TimerResets
+    $grade = Get-HealthGrade $healthScore
+
+    $events = Get-DailyEvents -Date $Date
+    $displayDate = ([DateTime]::ParseExact($Date, 'yyyy-MM-dd', $null)).ToString('dddd, MMMM d, yyyy')
+
+    # Build timeline HTML
+    $timelineHtml = ""
+    $eventTypeFriendly = @{
+        'BreakPrompted' = 'Break Prompted'; 'BreakTaken' = 'Break Taken'; 'BreakCompleted' = 'Break Completed'
+        'BreakEndedEarly' = 'Ended Early'; 'LockScreenBreak' = 'Lock Screen'; 'Snoozed' = 'Snoozed'
+        'Dismissed' = 'Dismissed'; 'ResetTimer' = 'Timer Reset'; 'MeetingDeferred' = 'Meeting Deferred'
+        'NaturalBreak' = 'Natural Break'; 'Paused' = 'Paused'; 'Resumed' = 'Resumed'
+        'ScreenLocked' = 'Screen Locked'; 'ScreenUnlocked' = 'Screen Unlocked'
+        'AppStarted' = 'App Started'; 'AppStopped' = 'App Stopped'
+    }
+    foreach ($evt in $events) {
+        $time = ([DateTime]::Parse($evt.Timestamp)).ToString('HH:mm')
+        $typeName = if ($eventTypeFriendly[$evt.Event]) { $eventTypeFriendly[$evt.Event] } else { $evt.Event }
+        $detail = ''
+        if ($evt.Event -eq 'Snoozed' -and $evt.Data.SnoozeNumber) { $detail = "#$($evt.Data.SnoozeNumber) of $($evt.Data.MaxSnoozes)" }
+        elseif ($evt.Event -eq 'BreakEndedEarly' -and $evt.Data.ElapsedSeconds) { $detail = "$([Math]::Round($evt.Data.ElapsedSeconds/60, 1))m of $([Math]::Round($evt.Data.TotalSeconds/60, 1))m" }
+        elseif ($evt.Event -eq 'MeetingDeferred' -and $evt.Data.SittingMinutes) { $detail = "at $($evt.Data.SittingMinutes)m" }
+        elseif ($evt.Event -eq 'ScreenUnlocked' -and $evt.Data.LockedMinutes) { $detail = "$($evt.Data.LockedMinutes)m away" }
+        elseif ($evt.Event -eq 'ResetTimer' -and $evt.Data.Source) { $detail = "via $($evt.Data.Source)" }
+        $detailSpan = if ($detail) { "<span style='color:#666;margin-left:8px;'>$detail</span>" } else { '' }
+        $timelineHtml += "<div class='timeline-event'><span class='timeline-time'>$time</span><span class='timeline-type event-$($evt.Event)'>$typeName</span>$detailSpan</div>`n"
+    }
+
+    # Generate insights
+    $insightsHtml = ""
+    if ($metrics.ComplianceRate -ge 80) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F3C6))</span>Great compliance today &mdash; $([Math]::Round($metrics.ComplianceRate))% of prompts led to breaks!</div>`n"
+    } elseif ($metrics.ComplianceRate -lt 50) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F4AA))</span>Room for improvement &mdash; only $([Math]::Round($metrics.ComplianceRate))% compliance today.</div>`n"
+    }
+    if ($metrics.MaxSittingStreak -gt 60) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1FA91))</span>Longest sitting streak was $($metrics.MaxSittingStreak) min &mdash; try to keep it under 60.</div>`n"
+    }
+    if ($metrics.MeetingDeferrals -gt 2) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F4C5))</span>$($metrics.MeetingDeferrals) meeting deferrals today. Consider scheduling breaks between meetings.</div>`n"
+    }
+    if ($metrics.NaturalBreaks -gt 0) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F6B6))</span>$($metrics.NaturalBreaks) natural break(s) detected &mdash; good job stepping away!</div>`n"
+    }
+    if ($metrics.SnoozeRate -gt 50) {
+        $insightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x23F0))</span>High snooze rate ($([Math]::Round($metrics.SnoozeRate))%). Try taking breaks on the first prompt.</div>`n"
+    }
+    if (-not $insightsHtml) {
+        $insightsHtml = "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x2728))</span>Solid day! Keep up the healthy habits.</div>`n"
+    }
+
+    $compPct = [Math]::Min([Math]::Round($metrics.ComplianceRate), 100)
+    $snoozePct = [Math]::Min([Math]::Round($metrics.SnoozeRate), 100)
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BreakTime Daily Report - $Date</title>
+    $(Get-ReportCSS)
+</head>
+<body>
+<div class="container">
+    <h1>$([char]::ConvertFromUtf32(0x2615)) BreakTime Daily Report</h1>
+    <div class="subtitle">$displayDate</div>
+
+    <div class="score-card">
+        <div class="score-big" style="color: $($grade.Color);">$healthScore</div>
+        <div class="score-label">Health Score</div>
+        <div class="grade-badge" style="background: $($grade.Color); color: #fff;">$($grade.Emoji) Grade $($grade.Grade)</div>
+    </div>
+
+    <h2>$([char]::ConvertFromUtf32(0x1F4CA)) Key Metrics</h2>
+    <div class="metrics">
+        <div class="metric-card">
+            <div class="metric-value">$($metrics.BreaksTaken + $metrics.LockScreenBreaks + $metrics.NaturalBreaks)</div>
+            <div class="metric-label">Total Breaks</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$($metrics.TotalPrompts)</div>
+            <div class="metric-label">Prompts Shown</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$($metrics.BreaksCompleted)</div>
+            <div class="metric-label">Full Breaks Completed</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$($metrics.MeetingDeferrals)</div>
+            <div class="metric-label">Meeting Deferrals</div>
+        </div>
+    </div>
+
+    <div style="margin: 12px 0;">
+        <div style="font-size:13px; margin-bottom:4px;">Compliance Rate: <strong>$compPct%</strong></div>
+        <div class="bar-container"><div class="bar-fill" style="width:${compPct}%; background: linear-gradient(90deg, #00d4ff, #4CAF50);"></div></div>
+    </div>
+    <div style="margin: 12px 0;">
+        <div style="font-size:13px; margin-bottom:4px;">Snooze Rate: <strong>$snoozePct%</strong></div>
+        <div class="bar-container"><div class="bar-fill" style="width:${snoozePct}%; background: linear-gradient(90deg, #FF9800, #F44336);"></div></div>
+    </div>
+
+    <h2>$([char]::ConvertFromUtf32(0x1F4A1)) Insights</h2>
+    <div class="insights">
+        $insightsHtml
+    </div>
+
+    <h2>$([char]::ConvertFromUtf32(0x1F4C5)) Activity Timeline</h2>
+    <div class="timeline">
+        $timelineHtml
+    </div>
+
+    <div class="footer">Generated by BreakTime on $(Get-Date -Format 'yyyy-MM-dd HH:mm') &bull; Stay healthy, take breaks!</div>
+</div>
+</body>
+</html>
+"@
+
+    $reportPath = Join-Path $script:ReportsDir "daily-$Date.html"
+    $html | Set-Content $reportPath -Encoding UTF8
+    return $reportPath
+}
+
+function New-WeeklyReport {
+    param([DateTime]$WeekEndDate)
+    if (-not $WeekEndDate) { $WeekEndDate = (Get-Date).Date }
+
+    # Find the Monday-Sunday range for the week ending on WeekEndDate
+    $dayOfWeek = [int]$WeekEndDate.DayOfWeek
+    $sundayOffset = if ($dayOfWeek -eq 0) { 0 } else { 7 - $dayOfWeek }
+    $weekEnd = $WeekEndDate.AddDays($sundayOffset)
+    $weekStart = $weekEnd.AddDays(-6)
+
+    $dailyData = @()
+    $allBreaks = 0; $allPrompts = 0; $allCompleted = 0; $allSnoozes = 0; $allResets = 0
+    $allNatural = 0; $allDeferred = 0; $maxSitting = 0; $daysActive = 0
+
+    for ($i = 0; $i -lt 7; $i++) {
+        $d = $weekStart.AddDays($i)
+        $dateStr = $d.ToString('yyyy-MM-dd')
+        $m = Get-DailyMetrics -Date $dateStr
+        if ($m -and $m.TotalPrompts -gt 0) {
+            $daysActive++
+            $score = Get-HealthScore -ComplianceRate $m.ComplianceRate -SnoozeRate $m.SnoozeRate `
+                -CompletedCount $m.BreaksCompleted -TakenCount $m.BreaksTaken `
+                -MaxSitting $m.MaxSittingStreak -MeetingDeferrals $m.MeetingDeferrals -ResetCount $m.TimerResets
+            $dailyData += @{ Date = $d; Metrics = $m; Score = $score }
+            $allBreaks += $m.BreaksTaken + $m.LockScreenBreaks + $m.NaturalBreaks
+            $allPrompts += $m.TotalPrompts
+            $allCompleted += $m.BreaksCompleted
+            $allSnoozes += $m.Snoozes
+            $allResets += $m.TimerResets
+            $allNatural += $m.NaturalBreaks
+            $allDeferred += $m.MeetingDeferrals
+            if ($m.MaxSittingStreak -gt $maxSitting) { $maxSitting = $m.MaxSittingStreak }
+        } else {
+            $dailyData += @{ Date = $d; Metrics = $null; Score = $null }
+        }
+    }
+
+    if ($daysActive -eq 0) { return $null }
+
+    $avgScore = [Math]::Round(($dailyData | Where-Object { $_.Score -ne $null } | ForEach-Object { $_.Score } | Measure-Object -Average).Average, 0)
+    $avgCompliance = if ($allPrompts -gt 0) { [Math]::Round(($allBreaks / $allPrompts) * 100, 0) } else { 0 }
+    $avgSnoozeRate = if ($allPrompts -gt 0) { [Math]::Round(($allSnoozes / $allPrompts) * 100, 0) } else { 0 }
+    $grade = Get-HealthGrade $avgScore
+
+    $weekRangeStr = "$($weekStart.ToString('MMM d')) - $($weekEnd.ToString('MMM d, yyyy'))"
+
+    # Build daily breakdown
+    $dayNames = @('Mon','Tue','Wed','Thu','Fri','Sat','Sun')
+    $dayRowsHtml = ""
+    for ($i = 0; $i -lt 7; $i++) {
+        $dd = $dailyData[$i]
+        $dayLabel = $dd.Date.ToString('ddd MMM d')
+        if ($dd.Score -ne $null) {
+            $dGrade = Get-HealthGrade $dd.Score
+            $breaks = $dd.Metrics.BreaksTaken + $dd.Metrics.LockScreenBreaks + $dd.Metrics.NaturalBreaks
+            $dayRowsHtml += @"
+        <div class='week-day'>
+            <span class='week-day-name'>$dayLabel</span>
+            <span class='week-day-score' style='color:$($dGrade.Color);'>$($dd.Score)</span>
+            <span class='week-day-stats'>$breaks breaks / $($dd.Metrics.TotalPrompts) prompts / $([Math]::Round($dd.Metrics.ComplianceRate))% compliance</span>
+        </div>
+"@
+        } else {
+            $dayRowsHtml += @"
+        <div class='week-day' style='opacity:0.4;'>
+            <span class='week-day-name'>$dayLabel</span>
+            <span class='week-day-score'>-</span>
+            <span class='week-day-stats'>No activity</span>
+        </div>
+"@
+        }
+    }
+
+    # Trend analysis
+    $scores = $dailyData | Where-Object { $_.Score -ne $null } | ForEach-Object { $_.Score }
+    $trendHtml = ""
+    if ($scores.Count -ge 2) {
+        $first = $scores[0]; $last = $scores[-1]
+        if ($last -gt $first + 5) {
+            $trendHtml = "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F4C8))</span>Upward trend! Your health score improved from $first to $last this week.</div>"
+        } elseif ($last -lt $first - 5) {
+            $trendHtml = "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F4C9))</span>Downward trend. Your score went from $first to $last. Try to be more consistent.</div>"
+        } else {
+            $trendHtml = "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x27A1))</span>Steady week &mdash; scores stayed consistent around $avgScore.</div>"
+        }
+    }
+    $weekInsightsHtml = $trendHtml
+    if ($allBreaks -gt 0) {
+        $weekInsightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x2615))</span>You took $allBreaks breaks across $daysActive active day(s) this week.</div>"
+    }
+    if ($allDeferred -gt 3) {
+        $weekInsightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F4C5))</span>$allDeferred meeting deferrals &mdash; block short break slots between meetings.</div>"
+    }
+    if ($allNatural -gt 0) {
+        $weekInsightsHtml += "<div class='insight-item'><span class='insight-icon'>$([char]::ConvertFromUtf32(0x1F6B6))</span>$allNatural natural breaks detected. Your body knows when to move!</div>"
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BreakTime Weekly Report - $weekRangeStr</title>
+    $(Get-ReportCSS)
+</head>
+<body>
+<div class="container">
+    <h1>$([char]::ConvertFromUtf32(0x1F4CA)) BreakTime Weekly Report</h1>
+    <div class="subtitle">$weekRangeStr</div>
+
+    <div class="score-card">
+        <div class="score-big" style="color: $($grade.Color);">$avgScore</div>
+        <div class="score-label">Average Health Score</div>
+        <div class="grade-badge" style="background: $($grade.Color); color: #fff;">$($grade.Emoji) Grade $($grade.Grade)</div>
+    </div>
+
+    <h2>$([char]::ConvertFromUtf32(0x1F4CA)) Weekly Summary</h2>
+    <div class="metrics">
+        <div class="metric-card">
+            <div class="metric-value">$allBreaks</div>
+            <div class="metric-label">Total Breaks</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$allPrompts</div>
+            <div class="metric-label">Total Prompts</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$avgCompliance%</div>
+            <div class="metric-label">Avg Compliance</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">$daysActive</div>
+            <div class="metric-label">Active Days</div>
+        </div>
+    </div>
+
+    <h2>$([char]::ConvertFromUtf32(0x1F5D3)) Daily Breakdown</h2>
+    $dayRowsHtml
+
+    <h2>$([char]::ConvertFromUtf32(0x1F4A1)) Weekly Insights</h2>
+    <div class="insights">
+        $weekInsightsHtml
+    </div>
+
+    <div class="footer">Generated by BreakTime on $(Get-Date -Format 'yyyy-MM-dd HH:mm') &bull; Stay healthy, take breaks!</div>
+</div>
+</body>
+</html>
+"@
+
+    $reportPath = Join-Path $script:ReportsDir "weekly-$($weekStart.ToString('yyyy-MM-dd')).html"
+    $html | Set-Content $reportPath -Encoding UTF8
+    return $reportPath
+}
 
 # ══════════════════════════════════════════════════════════════
 # SETTINGS MANAGEMENT — Load/save from settings.json
@@ -174,6 +692,7 @@ $script:DefaultSettings = @{
     BreakDurationMinutes     = 3
     PostMeetingBufferMinutes = 2
     IdleThresholdMinutes     = 2
+    MaxSnoozes               = 3
 }
 
 function Load-Settings {
@@ -185,6 +704,7 @@ function Load-Settings {
                 BreakDurationMinutes     = [int]($json.BreakDurationMinutes)
                 PostMeetingBufferMinutes = [int]($json.PostMeetingBufferMinutes)
                 IdleThresholdMinutes     = [int]($json.IdleThresholdMinutes)
+                MaxSnoozes               = if ($null -ne $json.MaxSnoozes) { [int]($json.MaxSnoozes) } else { 3 }
             }
         } else {
             $script:Settings = $script:DefaultSettings.Clone()
@@ -199,6 +719,35 @@ function Save-Settings {
     try {
         $script:Settings | ConvertTo-Json | Set-Content $script:SettingsPath -Encoding UTF8
     } catch { }
+}
+
+function Toggle-Pause {
+    param([System.Windows.Forms.ToolStripMenuItem]$MenuItem)
+    $script:Paused = -not $script:Paused
+    if ($script:Paused) {
+        $script:PausedElapsed = (Get-SittingMinutes)
+        if ($MenuItem) { $MenuItem.Text = "Resume" }
+        Write-BreakTimeEvent 'Paused'
+    } else {
+        if ($null -ne $script:PausedElapsed) {
+            $script:LastBreakTime = [DateTime]::Now.AddMinutes(-$script:PausedElapsed)
+            $script:PausedElapsed = $null
+        }
+        if ($MenuItem) { $MenuItem.Text = "Pause" }
+        Write-BreakTimeEvent 'Resumed'
+    }
+    Update-TrayIcon
+    Update-Widget
+}
+
+function Update-SettingsFromUI {
+    param([int]$Interval, [int]$Duration, [int]$Buffer, [int]$Idle, [int]$MaxSnoozes)
+    $script:Settings.BreakIntervalMinutes     = $Interval
+    $script:Settings.BreakDurationMinutes     = $Duration
+    $script:Settings.PostMeetingBufferMinutes = $Buffer
+    $script:Settings.IdleThresholdMinutes     = $Idle
+    $script:Settings.MaxSnoozes               = $MaxSnoozes
+    Save-Settings
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -281,12 +830,14 @@ function Get-SittingMinutes {
 
 function Reset-SittingTimer {
     # Resets all tracking state — called after breaks, screen unlock, or manual reset.
+    # Sets WaitingForActivity so the timer doesn't start until the user is back at the keyboard.
     $script:LastBreakTime = [DateTime]::Now
     $script:State = 'Tracking'
     $script:SnoozeCount = 0
     $script:SnoozedAt = $null
     $script:MeetingEndedAt = $null
     $script:LastMediaDetectedAt = $null
+    $script:WaitingForActivity = $true
     Update-TrayIcon
     Update-Widget
 }
@@ -299,15 +850,18 @@ $sessionSwitchHandler = {
     if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
         $script:ScreenLocked = $true
         $script:ScreenLockedAt = [DateTime]::Now
+        Write-BreakTimeEvent 'ScreenLocked'
     }
     if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionUnlock) {
         $script:ScreenLocked = $false
+        $lockedMinutes = 0
         if ($script:ScreenLockedAt) {
             $lockedMinutes = ([DateTime]::Now - $script:ScreenLockedAt).TotalMinutes
             if ($lockedMinutes -ge $script:Settings.IdleThresholdMinutes) {
                 Reset-SittingTimer
             }
         }
+        Write-BreakTimeEvent 'ScreenUnlocked' @{ LockedMinutes = [Math]::Round($lockedMinutes, 1) }
         $script:ScreenLockedAt = $null
     }
 }
@@ -482,6 +1036,18 @@ function Update-Widget {
         return
     }
 
+    # Waiting for activity after break/reset — don't count sitting time yet
+    if ($script:WaitingForActivity) {
+        $widgetTime.Text = "Ready"
+        $widgetTime.FontSize = 24
+        $widgetTime.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
+        $widgetStatus.Text = "waiting for activity"
+        $widgetIcon.Text = [char]0x2705  # ✅
+        $widgetIcon.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
+        $widgetBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
+        return
+    }
+
     # Active break — show simple "On Break!" status (no timer, avoids closure scoping issues)
     if ($script:OnBreak) {
         $widgetTime.Text = "On Break!"
@@ -501,7 +1067,7 @@ function Update-Widget {
         $widgetTime.FontSize = 20
         $widgetTime.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#4FC3F7')
         $widgetStatus.Text = "break deferred"
-        $widgetIcon.Text = [char]0x1F3A4  # 🎤
+        $widgetIcon.Text = [char]::ConvertFromUtf32(0x1F3A4)  # 🎤
         $widgetIcon.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#4FC3F7')
         $widgetBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#4FC3F7')
         return
@@ -561,19 +1127,25 @@ function Show-BreakPrompt {
     param([bool]$AllowSnooze = $true)
 
     $script:OverlayShowing = $true
+    Write-BreakTimeEvent 'BreakPrompted' @{ AllowSnooze = $AllowSnooze; SnoozeCount = $script:SnoozeCount }
 
     # Determine UI visibility based on snooze allowance
     $snoozeVisibility = if ($AllowSnooze) { 'Visible' } else { 'Collapsed' }
     $closeVisibility = if ($AllowSnooze) { 'Visible' } else { 'Collapsed' }
+    $maxSnoozes = $script:Settings.MaxSnoozes
+    $snoozesRemaining = $maxSnoozes - $script:SnoozeCount
     $mandatoryNote = if (-not $AllowSnooze) {
-        '<TextBlock Text="Snooze already used - please take a break" FontSize="12" Foreground="#EF5350" HorizontalAlignment="Center" Margin="0,0,0,4" FontFamily="Segoe UI"/>'
+        '<TextBlock Text="All snoozes used - please take a break" FontSize="12" Foreground="#EF5350" HorizontalAlignment="Center" Margin="0,0,0,4" FontFamily="Segoe UI"/>'
+    } elseif ($snoozesRemaining -le $maxSnoozes -and $snoozesRemaining -gt 0) {
+        "<TextBlock Text=`"$snoozesRemaining snooze$(if ($snoozesRemaining -ne 1) { 's' }) remaining`" FontSize=`"12`" Foreground=`"#FFB74D`" HorizontalAlignment=`"Center`" Margin=`"0,0,0,4`" FontFamily=`"Segoe UI`"/>"
     } else { '' }
 
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         WindowStartupLocation="CenterScreen" SizeToContent="WidthAndHeight"
-        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize">
+        Topmost="True" ShowInTaskbar="True" ResizeMode="NoResize"
+        Title="BreakTime - Break Reminder">
     <Border Background="#DD1a1a2e" CornerRadius="16" BorderBrush="#88667799"
             BorderThickness="2" Padding="0">
         <Border.Effect>
@@ -638,6 +1210,17 @@ function Show-BreakPrompt {
                         <TextBlock Text="Snooze (3 min)" FontSize="14" VerticalAlignment="Center"/>
                     </StackPanel>
                 </Button>
+
+                <Button Name="ResetBtn" Cursor="Hand" Margin="0,6,0,0"
+                        Background="Transparent" Foreground="#88AABBCC" BorderThickness="1"
+                        BorderBrush="#44667799"
+                        FontFamily="Segoe UI" FontSize="13" Padding="40,10"
+                        HorizontalAlignment="Stretch">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                        <TextBlock Text="&#x1F504;  " FontSize="13" VerticalAlignment="Center"/>
+                        <TextBlock Text="Reset Timer" FontSize="13" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Button>
             </StackPanel>
         </Grid>
     </Border>
@@ -651,11 +1234,24 @@ function Show-BreakPrompt {
     $lockScreenBtn = $window.FindName('LockScreenBtn')
     $snoozeBtn     = $window.FindName('SnoozeBtn')
 
-    # Title bar drag (try-catch: DragMove throws if mouse button isn't held)
+    # Title bar drag (guarded: only drag when mouse button is actually pressed)
     $promptTitleBar = $window.FindName('PromptTitleBar')
     $promptTitleBar.Add_MouseLeftButtonDown({
         param($s, $e)
-        try { $window.DragMove() } catch { }
+        if ($e.LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+            try { $window.DragMove() } catch { }
+        }
+    }.GetNewClosure())
+
+    # Escape key to dismiss (same as close button when allowed, ignored on mandatory)
+    $window.Add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Escape) {
+            if ($AllowSnooze) {
+                $window.Tag = 'Dismissed'
+                $window.Close()
+            }
+        }
     }.GetNewClosure())
 
     # Close button on prompt (only available when snooze is allowed)
@@ -683,11 +1279,18 @@ function Show-BreakPrompt {
         $window.Close()
     }.GetNewClosure())
 
+    # Option 4: Reset Timer
+    $resetBtn = $window.FindName('ResetBtn')
+    $resetBtn.Add_Click({
+        $window.Tag = 'Reset'
+        $window.Close()
+    }.GetNewClosure())
+
     # Prevent Alt+F4 on mandatory (no snooze) breaks
     if (-not $AllowSnooze) {
         $window.Add_Closing({
             param($s, $e)
-            if ($window.Tag -ne 'TakeBreak' -and $window.Tag -ne 'LockScreen') {
+            if ($window.Tag -ne 'TakeBreak' -and $window.Tag -ne 'LockScreen' -and $window.Tag -ne 'Reset') {
                 $e.Cancel = $true
             }
         }.GetNewClosure())
@@ -698,9 +1301,11 @@ function Show-BreakPrompt {
     # Handle user's choice
     switch ($window.Tag) {
         'TakeBreak' {
+            Write-BreakTimeEvent 'BreakTaken'
             Show-BreakCountdown
         }
         'LockScreen' {
+            Write-BreakTimeEvent 'LockScreenBreak'
             Reset-SittingTimer
             [NativeMethods]::LockWorkStation() | Out-Null
         }
@@ -708,12 +1313,18 @@ function Show-BreakPrompt {
             $script:SnoozeCount++
             $script:SnoozedAt = [DateTime]::Now
             $script:State = 'Snoozed'
+            Write-BreakTimeEvent 'Snoozed' @{ SnoozeNumber = $script:SnoozeCount; MaxSnoozes = $script:Settings.MaxSnoozes }
         }
         'Dismissed' {
             # Closing via X counts as a snooze
             $script:SnoozeCount++
             $script:SnoozedAt = [DateTime]::Now
             $script:State = 'Snoozed'
+            Write-BreakTimeEvent 'Dismissed' @{ SnoozeNumber = $script:SnoozeCount }
+        }
+        'Reset' {
+            Write-BreakTimeEvent 'ResetTimer' @{ Source = 'BreakPrompt' }
+            Reset-SittingTimer
         }
     }
 
@@ -828,17 +1439,23 @@ function Show-BreakCountdown {
     $secs = $state.Remaining % 60
     $timerText.Text = '{0}:{1:D2}' -f $mins, $secs
 
-    # Title bar drag (try-catch: DragMove throws if mouse button isn't held)
+    # Title bar drag (guarded: only drag when mouse button is actually pressed)
     $breakTitleBar = $window.FindName('BreakTitleBar')
     $breakTitleBar.Add_MouseLeftButtonDown({
         param($s, $e)
-        try { $window.DragMove() } catch { }
+        if ($e.LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+            try { $window.DragMove() } catch { }
+        }
     }.GetNewClosure())
 
-    # Also allow dragging from the content area
-    $window.Add_MouseLeftButtonDown({
+    # Escape key to close break countdown early
+    $window.Add_KeyDown({
         param($s, $e)
-        try { $window.DragMove() } catch { }
+        if ($e.Key -eq [System.Windows.Input.Key]::Escape) {
+            $state.Completed = $true
+            $window.Tag = 'Completed'
+            $window.Close()
+        }
     }.GetNewClosure())
 
     # Minimize button — minimizes to taskbar, timer keeps running
@@ -950,6 +1567,15 @@ function Show-BreakCountdown {
     try {
         $window.ShowDialog() | Out-Null
     } finally {
+        # Log break completion
+        $elapsedSec = $breakSeconds - $state.Remaining
+        if ($state.Completed -and $state.Remaining -le 0) {
+            Write-BreakTimeEvent 'BreakCompleted' @{ BreakDurationSeconds = $breakSeconds }
+        } elseif ($state.Completed -or $window.Tag -eq 'Completed') {
+            Write-BreakTimeEvent 'BreakEndedEarly' @{ ElapsedSeconds = $elapsedSec; TotalSeconds = $breakSeconds }
+        } elseif ($window.Tag -eq 'LockScreen') {
+            Write-BreakTimeEvent 'BreakEndedEarly' @{ ElapsedSeconds = $elapsedSec; TotalSeconds = $breakSeconds; Reason = 'LockScreen' }
+        }
         # Always clean up break state and restart the sitting timer
         $script:OnBreak = $false
         $script:BreakEndTime = $null
@@ -969,7 +1595,7 @@ function Show-BreakCountdown {
 function Show-SettingsWindow {
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="BreakTime Settings" Width="420" Height="380"
+        Title="BreakTime Settings" Width="420" Height="440"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="#1e1e2e" Foreground="#E0E0E0" FontFamily="Segoe UI">
     <StackPanel Margin="25">
@@ -1008,6 +1634,14 @@ function Show-SettingsWindow {
                     IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center"/>
         </DockPanel>
 
+        <TextBlock Text="Max snoozes per break:" Margin="0,15,0,4"/>
+        <DockPanel>
+            <TextBlock Name="SnoozeValue" DockPanel.Dock="Right" Width="40"
+                       TextAlignment="Right" VerticalAlignment="Center" Foreground="#4FC3F7"/>
+            <Slider Name="SnoozeSlider" Minimum="1" Maximum="5"
+                    IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center"/>
+        </DockPanel>
+
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,25,0,0">
             <Button Name="SaveButton" Content="Save" Width="80" Padding="0,8"
                     Background="#4FC3F7" Foreground="#1e1e2e" BorderThickness="0"
@@ -1031,6 +1665,8 @@ function Show-SettingsWindow {
     $bufferValue    = $window.FindName('BufferValue')
     $idleSlider     = $window.FindName('IdleSlider')
     $idleValue      = $window.FindName('IdleValue')
+    $snoozeSlider   = $window.FindName('SnoozeSlider')
+    $snoozeValue    = $window.FindName('SnoozeValue')
     $saveBtn        = $window.FindName('SaveButton')
     $cancelBtn      = $window.FindName('CancelButton')
 
@@ -1039,6 +1675,7 @@ function Show-SettingsWindow {
     $durationSlider.Value = $script:Settings.BreakDurationMinutes
     $bufferSlider.Value   = $script:Settings.PostMeetingBufferMinutes
     $idleSlider.Value     = $script:Settings.IdleThresholdMinutes
+    $snoozeSlider.Value   = $script:Settings.MaxSnoozes
 
     # Value display updaters
     $updateLabels = {
@@ -1046,6 +1683,7 @@ function Show-SettingsWindow {
         $durationValue.Text = "$([int]$durationSlider.Value)"
         $bufferValue.Text   = "$([int]$bufferSlider.Value)"
         $idleValue.Text     = "$([int]$idleSlider.Value)"
+        $snoozeValue.Text   = "$([int]$snoozeSlider.Value)"
     }
     & $updateLabels
 
@@ -1053,13 +1691,11 @@ function Show-SettingsWindow {
     $durationSlider.Add_ValueChanged({ & $updateLabels }.GetNewClosure())
     $bufferSlider.Add_ValueChanged({ & $updateLabels }.GetNewClosure())
     $idleSlider.Add_ValueChanged({ & $updateLabels }.GetNewClosure())
+    $snoozeSlider.Add_ValueChanged({ & $updateLabels }.GetNewClosure())
 
     $saveBtn.Add_Click({
-        $script:Settings.BreakIntervalMinutes     = [int]$intervalSlider.Value
-        $script:Settings.BreakDurationMinutes     = [int]$durationSlider.Value
-        $script:Settings.PostMeetingBufferMinutes = [int]$bufferSlider.Value
-        $script:Settings.IdleThresholdMinutes     = [int]$idleSlider.Value
-        Save-Settings
+        Update-SettingsFromUI -Interval ([int]$intervalSlider.Value) -Duration ([int]$durationSlider.Value) `
+            -Buffer ([int]$bufferSlider.Value) -Idle ([int]$idleSlider.Value) -MaxSnoozes ([int]$snoozeSlider.Value)
         $window.Close()
     }.GetNewClosure())
 
@@ -1099,19 +1735,13 @@ function Initialize-SystemTray {
     $pauseItem = $menu.Items.Add("Pause")
     $pauseItem.Name = 'PauseItem'
     $pauseItem.Add_Click({
-        $script:Paused = -not $script:Paused
-        if ($script:Paused) {
-            $pauseItem.Text = "Resume"
-        } else {
-            $pauseItem.Text = "Pause"
-            Reset-SittingTimer
-        }
-        Update-TrayIcon
+        Toggle-Pause -MenuItem $pauseItem
     }.GetNewClosure())
 
     # Reset Timer
     $resetItem = $menu.Items.Add("Reset Timer")
     $resetItem.Add_Click({
+        Write-BreakTimeEvent 'ResetTimer' @{ Source = 'TrayMenu' }
         Reset-SittingTimer
         Update-TrayIcon
     })
@@ -1133,6 +1763,26 @@ function Initialize-SystemTray {
 
     $menu.Items.Add('-') | Out-Null
 
+    # Reports
+    $reportItem = $menu.Items.Add("Generate Today's Report")
+    $reportItem.Add_Click({
+        $todayStr = (Get-Date).ToString('yyyy-MM-dd')
+        $path = New-DailyReport -Date $todayStr
+        if ($path -and (Test-Path $path)) {
+            Start-Process $path
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("No break data recorded yet today.", "BreakTime Reports", 'OK', 'Information') | Out-Null
+        }
+    })
+
+    $viewReportsItem = $menu.Items.Add("View Reports Folder")
+    $viewReportsItem.Add_Click({
+        if (-not (Test-Path $script:ReportsDir)) { New-Item -ItemType Directory -Path $script:ReportsDir -Force | Out-Null }
+        Start-Process "explorer.exe" -ArgumentList $script:ReportsDir
+    })
+
+    $menu.Items.Add('-') | Out-Null
+
     # Settings
     $settingsItem = $menu.Items.Add("Settings...")
     $settingsItem.Add_Click({
@@ -1145,6 +1795,7 @@ function Initialize-SystemTray {
     # Exit
     $exitItem = $menu.Items.Add("Exit")
     $exitItem.Add_Click({
+        Write-BreakTimeEvent 'AppStopped'
         if ($script:WidgetTimer) { $script:WidgetTimer.Stop() }
         if ($script:Widget) { $script:Widget.Close() }
         $script:TrayIcon.Visible = $false
@@ -1175,11 +1826,37 @@ function Initialize-MainTimer {
             return
         }
 
+        # ── Report generation trigger: check for day/week rollover ──
+        $todayStr = (Get-Date).ToString('yyyy-MM-dd')
+        if ($script:LastReportDate -and $script:LastReportDate -ne $todayStr) {
+            # New day detected → generate previous day's report
+            try { New-DailyReport -Date $script:LastReportDate } catch { }
+            # If today is Monday, generate weekly report for the previous week
+            if ((Get-Date).DayOfWeek -eq [DayOfWeek]::Monday) {
+                try { New-WeeklyReport -WeekEndDate (Get-Date).AddDays(-1) } catch { }
+            }
+        }
+        $script:LastReportDate = $todayStr
+
         # Sample audio state every tick (builds sustained detection via grace window)
         Update-MediaActivity
 
+        # If waiting for activity after a break, check if user is back
+        if ($script:WaitingForActivity) {
+            $idleSec = [NativeMethods]::GetIdleSeconds()
+            if ($idleSec -lt 10) {
+                # User is active — start the sitting clock now
+                $script:WaitingForActivity = $false
+                $script:LastBreakTime = [DateTime]::Now
+                Update-TrayIcon
+                Update-Widget
+            }
+            return
+        }
+
         # Check for natural break (idle + no recent media → walked away)
         if (Test-NaturalBreak) {
+            Write-BreakTimeEvent 'NaturalBreak'
             Reset-SittingTimer
             return
         }
@@ -1198,9 +1875,10 @@ function Initialize-MainTimer {
             'Tracking' {
                 if ($sitting -ge $interval) {
                     if (Test-InMeeting) {
+                        Write-BreakTimeEvent 'MeetingDeferred' @{ SittingMinutes = [Math]::Round($sitting, 0) }
                         $script:State = 'Deferred'
                     } else {
-                        Show-BreakPrompt -AllowSnooze ($script:SnoozeCount -lt 1)
+                        Show-BreakPrompt -AllowSnooze ($script:SnoozeCount -lt $script:Settings.MaxSnoozes)
                     }
                 }
             }
@@ -1217,7 +1895,7 @@ function Initialize-MainTimer {
                     if (Test-InMeeting) {
                         $script:State = 'Deferred'
                     } else {
-                        Show-BreakPrompt -AllowSnooze ($script:SnoozeCount -lt 1)
+                        Show-BreakPrompt -AllowSnooze ($script:SnoozeCount -lt $script:Settings.MaxSnoozes)
                     }
                 }
             }
@@ -1227,7 +1905,7 @@ function Initialize-MainTimer {
                     if (Test-InMeeting) {
                         $script:State = 'Deferred'
                     } else {
-                        Show-BreakPrompt -AllowSnooze $false
+                        Show-BreakPrompt -AllowSnooze ($script:SnoozeCount -lt $script:Settings.MaxSnoozes)
                     }
                 }
             }
@@ -1249,6 +1927,7 @@ $script:App.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 
 # Initialize widget and main timer once the app event loop is running
 $script:App.Add_Startup({
+    Write-BreakTimeEvent 'AppStarted' @{ Version = '1.0'; Interval = $script:Settings.BreakIntervalMinutes; Duration = $script:Settings.BreakDurationMinutes }
     Initialize-Widget
     $script:MainTimer = Initialize-MainTimer
     Update-TrayIcon

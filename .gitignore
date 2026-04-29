@@ -6,3 +6,6 @@
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Compiled executable (build locally via ps2exe)
+*.exe

@@ -29,10 +29,12 @@ Sitting for long stretches is bad for you — but traditional break reminders ar
 | **Natural Break Detection** | Idle time exceeds threshold AND no media playing → you walked away → timer resets automatically |
 | **Screen Lock Detection** | `SessionSwitch` events — if screen is locked for 2+ minutes, counts as a break on unlock |
 | **Smart Deferral** | Break reminder is deferred during meetings, with a configurable post-meeting buffer before it triggers |
-| **3-Option Break Dialog** | High-contrast dark dialog with prominent coffee icon, bold border, and drop shadow. Three options: (1) Taking Break Now → full-screen countdown, (2) Lock Screen & Break → locks PC and resets timer, (3) Snooze |
-| **Snooze** | One 3-minute snooze allowed per break cycle, then snooze is hidden and break is mandatory |
+| **4-Option Break Dialog** | High-contrast dark dialog with prominent coffee icon, bold border, and drop shadow. Four options: (1) Taking Break Now → full-screen countdown, (2) Lock Screen & Break → locks PC and resets timer, (3) Snooze, (4) Reset Timer → resets sitting clock without taking a break. Shows in taskbar for easy Alt+Tab access. Escape key dismisses (counts as snooze). |
+| **Configurable Snoozes** | Up to N snoozes allowed per break cycle (default 3, configurable 1–5 via settings). Snooze count displayed on the prompt. After all snoozes are used, snooze is hidden and break is mandatory. |
+| **Reset Timer Button** | Available on every prompt (even mandatory ones). Resets the sitting timer without taking a break — useful when you've been standing at a desk or stretching informally. |
+| **Analytics & Reporting** | Comprehensive event logging to daily JSON files. Auto-generates styled HTML daily reports (on day rollover) and weekly reports (on Mondays). Health Score system (0–100) with letter grades A–F. |
 | **System Tray** | Color-coded icons: 🟢 tracking, 🟠 break soon, 🔴 overdue, ⚫ paused |
-| **Settings UI** | Dark-themed WPF window with sliders for all settings |
+| **Settings UI** | Dark-themed WPF window with sliders for all settings including MaxSnoozes |
 
 ---
 
@@ -41,6 +43,7 @@ Sitting for long stretches is bad for you — but traditional break reminders ar
 ### Tech Stack
 
 - **PowerShell 5.1+** — script host, no compilation needed
+- **ps2exe** — optional compilation to standalone `.exe` (no PowerShell console required)
 - **WPF (Windows Presentation Foundation)** — overlay and settings UI via XAML
 - **Windows Forms** — system tray (`NotifyIcon`)
 - **C# via `Add-Type`** — inline compiled helpers for Win32 interop and COM audio
@@ -63,17 +66,20 @@ Tracking ──[interval reached]──┬──[in meeting]──► Deferred
                                │
                                ▼
                         Show Break Prompt
-                     ┌───────┼───────────┐
-               [Take Break] [Lock Screen] [Snooze]
-                     │         │              │
-                     ▼         ▼              ▼
-              Full-Screen   Lock PC +     Snoozed ──[3 min]──► Show Prompt (no snooze)
-              Countdown     Reset Timer
-                     │
-               [completed]
-                     │
-                     ▼
-                   Reset
+               ┌───────┼───────────┬───────────┐
+         [Take Break] [Lock Screen] [Snooze]  [Reset Timer]
+               │         │              │           │
+               ▼         ▼              ▼           ▼
+        Full-Screen   Lock PC +     Snoozed     Reset Timer
+        Countdown     Reset Timer      │        (no break)
+               │                       │
+         [completed]            [3 min, snoozes left?]
+               │                  ┌────┴────┐
+               ▼               [yes]      [no]
+             Reset                │         │
+                                  ▼         ▼
+                            Show Prompt  Mandatory Prompt
+                           (with snooze) (snooze hidden)
 ```
 
 **States:**
@@ -83,7 +89,7 @@ Tracking ──[interval reached]──┬──[in meeting]──► Deferred
 | `Tracking` | Counting sitting time. Checks every 10 seconds. |
 | `Deferred` | Break is due but user is in a meeting. Waits for meeting to end. |
 | `Buffering` | Meeting just ended. Waits for post-meeting buffer before showing break. |
-| `Snoozed` | User snoozed the break. Waits 3 minutes then shows mandatory break. |
+| `Snoozed` | User snoozed the break. Waits 3 minutes then re-prompts. If snooze count < MaxSnoozes, snooze is still available; otherwise, break is mandatory. |
 
 ### Timer Reset Conditions
 
@@ -92,7 +98,7 @@ The sitting timer resets (back to 0) when any of these occur:
 - **Natural break** — No keyboard/mouse input AND no audio playing for the idle threshold duration
 - **Screen locked** — Screen was locked for 2+ minutes (detected on unlock)
 - **Break completed** — Countdown overlay reached 0:00, or "Lock Screen & Break" was chosen
-- **Manual reset** — User clicks "Reset Timer" in tray menu
+- **Manual reset** — User clicks "Reset Timer" in tray menu or on the break prompt
 - **Resume from pause** — User un-pauses tracking
 
 ### Timer Continues When
@@ -106,10 +112,16 @@ The sitting timer resets (back to 0) when any of these occur:
 
 ```
 BreakTime/
-├── BreakTime.ps1       # Main application (~1120 lines)
+├── BreakTime.ps1       # Main application (~1900 lines)
+├── BreakTime.exe       # Compiled standalone executable (built via ps2exe, not committed)
 ├── settings.json       # User-configurable settings
 ├── Start-BreakTime.bat # Launcher (runs PS in STA mode, hides console)
-└── README.md           # This file
+├── README.md           # This file
+├── logs/               # Daily event logs (auto-created)
+│   └── YYYY-MM-DD.json             # One JSON-Lines file per day
+└── reports/            # Generated HTML reports (auto-created)
+    ├── daily-YYYY-MM-DD.html       # Daily health report
+    └── weekly-YYYY-MM-DD.html      # Weekly summary (Monday date)
 ```
 
 ### BreakTime.ps1 — Module Breakdown
@@ -124,10 +136,13 @@ BreakTime/
 | Screen Lock Handler | `SystemEvents.SessionSwitch` handler — tracks lock/unlock times |
 | Icon Creation | Generates colored circle icons programmatically via `System.Drawing` (no external icon files needed) |
 | Countdown Widget | Always-on-top floating WPF window with centered layout, large clock icon (FontSize 30), bold timer text (FontSize 26), and high-contrast colors on a dark translucent background (`#CC1a1a2e`) with a 2px border. Title bar with minimize/close buttons. Updates every 1 second. Shows state: countdown, on break (green), BREAK!, PAUSED, MEETING, snooze remaining. Icon and border colors update per-state. |
-| Break Prompt | Centered WPF dialog with high-contrast dark theme (`#DD1a1a2e`), 2px border, strong drop shadow, large coffee icon (FontSize 56). Three options: Take Break Now, Lock Screen & Break, Snooze. Snooze hidden after first use. Matching visual style with the floating widget. |
+| Break Prompt | Centered WPF dialog with high-contrast dark theme (`#DD1a1a2e`), 2px border, strong drop shadow, large coffee icon (FontSize 56). Four options: Take Break Now, Lock Screen & Break, Snooze (with remaining count), Reset Timer. Snooze hidden after max snoozes used. Shows in taskbar. Escape key dismisses. Matching visual style with the floating widget. |
 | Break Countdown | Idle-gated WPF dialog shown after choosing "Taking Break Now." Timer only counts down while user is idle (10s threshold). Turns red with flashing ✋ hand when user is active. Includes Lock Screen button. Resets timer on completion. |
-| Settings Window | WPF dialog with sliders for all 4 configurable values |
-| System Tray | `NotifyIcon` with context menu: status display, Take a Break, Pause/Resume, Reset Timer, Settings, Exit |
+| Event Logging | `Write-BreakTimeEvent` appends JSON-Lines to daily log files in `logs/`. Tracks 15 event types with timestamps and contextual data. |
+| Analytics Engine | `Get-DailyMetrics` computes compliance rate, snooze rate, break quality, hourly distribution. `Get-HealthScore` produces a weighted 0–100 score. |
+| Report Generators | `New-DailyReport` and `New-WeeklyReport` produce dark-themed HTML reports with health scores, metric cards, progress bars, insights, and activity timelines. |
+| Settings Window | WPF dialog with sliders for all 5 configurable values (including MaxSnoozes) |
+| System Tray | `NotifyIcon` with context menu: status display, Take a Break, Pause/Resume, Reset Timer, Show/Hide Widget, Generate Today's Report, View Reports Folder, Settings, Exit |
 | Main Timer | `DispatcherTimer` at 10-second interval driving the state machine |
 | Entry Point | Creates WPF `Application` with `OnExplicitShutdown`, starts timer on `Startup` event |
 
@@ -138,22 +153,37 @@ BreakTime/
     "BreakIntervalMinutes": 45,
     "BreakDurationMinutes": 3,
     "PostMeetingBufferMinutes": 2,
-    "IdleThresholdMinutes": 2
+    "IdleThresholdMinutes": 2,
+    "MaxSnoozes": 3
 }
 ```
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `BreakIntervalMinutes` | 45 | Minutes of continuous sitting before a break is triggered |
-| `BreakDurationMinutes` | 3 | Length of the break countdown |
-| `PostMeetingBufferMinutes` | 2 | Grace period after a meeting ends before showing the break overlay |
-| `IdleThresholdMinutes` | 2 | Minutes of no input + no audio required to count as a natural break |
+| Setting | Default | Range | Description |
+|---------|---------|-------|-------------|
+| `BreakIntervalMinutes` | 45 | 5–120 | Minutes of continuous sitting before a break is triggered |
+| `BreakDurationMinutes` | 3 | 1–10 | Length of the break countdown |
+| `PostMeetingBufferMinutes` | 2 | 1–10 | Grace period after a meeting ends before showing the break overlay |
+| `IdleThresholdMinutes` | 2 | 1–10 | Minutes of no input + no audio required to count as a natural break |
+| `MaxSnoozes` | 3 | 1–5 | Number of snoozes allowed per break cycle before the break becomes mandatory |
 
 ---
 
 ## Usage
 
 ### Launch
+
+#### Option 1: Standalone Executable (Recommended)
+
+Compile the script to a standalone `.exe` using [ps2exe](https://github.com/MScholtes/PS2EXE) — no PowerShell console required:
+
+```powershell
+Install-Module -Name ps2exe -Scope CurrentUser -Force
+Invoke-ps2exe -InputFile ".\BreakTime.ps1" -OutputFile ".\BreakTime.exe" -NoConsole -STA -Title "BreakTime" -Description "Smart Break Reminder for Windows"
+```
+
+Then simply double-click **BreakTime.exe** to run. This eliminates the dependency on a PowerShell console window — the app runs as a native Windows process.
+
+#### Option 2: PowerShell Script
 
 Double-click **Start-BreakTime.bat**, or run directly:
 
@@ -189,7 +219,11 @@ When the break interval is reached, a centered dialog appears with three options
 |--------|--------|
 | **🚶 Taking Break Now** | Opens an idle-gated countdown dialog. Timer only ticks while you're away from the keyboard (10+ seconds idle). If you keep working, the UI turns red with a flashing ✋ hand until you step away. Timer resets when countdown finishes. |
 | **🔒 Lock Screen & Break** | Immediately locks your PC and resets the sitting timer. Walk away! |
-| **⏸ Snooze (3 min)** | Delays the break by 3 minutes. Only available once — after snooze, the next prompt has no snooze option. |
+| **⏸ Snooze (3 min)** | Delays the break by 3 minutes. Shows remaining snooze count (e.g., "2 of 3 remaining"). Hidden once all snoozes are used — break becomes mandatory. |
+| **🔄 Reset Timer** | Resets the sitting timer to zero without taking a break. Always available, even on mandatory prompts. Useful when you've been standing or stretching informally. |
+| **Escape key** | Dismisses the prompt (counts as a snooze if snoozes remain). |
+
+> **Note:** The break prompt now shows in the Windows taskbar (`ShowInTaskbar`) so it can be found via Alt+Tab if covered by other windows.
 
 ### System Tray Menu (right-click)
 
@@ -197,15 +231,34 @@ When the break interval is reached, a centered dialog appears with three options
 |------|--------|
 | **Sitting: X / Y min** | Status display (not clickable) |
 | **Take a Break Now** | Shows the break prompt dialog |
-| **Pause / Resume** | Stops/restarts tracking. Resume resets the timer. |
+| **Pause / Resume** | Stops/restarts tracking. Resume continues the timer from where it left off. |
 | **Reset Timer** | Resets sitting time to 0 without taking a break |
 | **Hide / Show Widget** | Toggles the floating countdown widget |
+| **Generate Today's Report** | Creates an HTML report for today's activity and opens it in your browser |
+| **View Reports Folder** | Opens the `reports/` folder in File Explorer |
 | **Settings...** | Opens the settings window |
 | **Exit** | Closes the app |
 
 Double-clicking the tray icon opens Settings.
 
 ### Auto-Start with Windows
+
+#### If using the compiled `.exe` (Recommended)
+
+Run this PowerShell command to create a startup shortcut:
+
+```powershell
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut("$([System.Environment]::GetFolderPath('Startup'))\BreakTime.lnk")
+$shortcut.TargetPath = "<full path to BreakTime.exe>"
+$shortcut.WorkingDirectory = "<folder containing BreakTime.exe>"
+$shortcut.Description = "BreakTime - Smart Break Reminder"
+$shortcut.Save()
+```
+
+Or manually: press **Win+R** → `shell:startup` → place a shortcut to `BreakTime.exe` there.
+
+#### If using the PowerShell script
 
 Create a shortcut to `Start-BreakTime.bat` and place it in:
 
@@ -256,18 +309,93 @@ If peak > 0.0001, audio is actively playing. This detects any audio output: musi
 
 ---
 
+## Analytics & Reporting
+
+BreakTime includes a comprehensive analytics system that tracks every meaningful event and generates styled HTML reports automatically.
+
+### Event Logging
+
+Every action is logged as a JSON-Lines entry in `logs/breaktime-YYYY-MM-DD.json`. Each entry includes a timestamp, event type, and optional contextual data.
+
+| Event | When Logged | Data |
+|-------|-------------|------|
+| `AppStarted` | App launches | Version, interval, duration settings |
+| `AppStopped` | App exits via tray menu | — |
+| `BreakPrompted` | Break prompt dialog shown | AllowSnooze, current SnoozeCount |
+| `BreakTaken` | User clicks "Taking Break Now" | — |
+| `BreakCompleted` | Break countdown reaches 0:00 | BreakDurationSeconds |
+| `BreakEndedEarly` | User closes break before completion | ElapsedSeconds, TotalSeconds |
+| `LockScreenBreak` | User clicks "Lock Screen & Break" | — |
+| `Snoozed` | User clicks Snooze | SnoozeNumber, MaxSnoozes |
+| `Dismissed` | User closes prompt via X button | SnoozeNumber |
+| `ResetTimer` | Timer reset from prompt or tray | Source (BreakPrompt / TrayMenu) |
+| `MeetingDeferred` | Break deferred due to active meeting | SittingMinutes |
+| `NaturalBreak` | Idle + no media detected → walked away | — |
+| `Paused` / `Resumed` | Tracking paused/resumed via tray | — |
+| `ScreenLocked` | Windows session locked | — |
+| `ScreenUnlocked` | Windows session unlocked | LockedMinutes |
+
+### Health Score (0–100)
+
+A weighted composite score calculated daily:
+
+| Component | Weight | Logic |
+|-----------|--------|-------|
+| **Compliance** | 40% | Percentage of prompts that led to breaks |
+| **Break Quality** | 20% | Ratio of fully completed breaks vs. taken |
+| **Low Snooze** | 20% | Lower snooze rate = higher score |
+| **Sitting Discipline** | 15% | Penalty for sitting streaks > 50 minutes |
+| **Reset Penalty** | 5% | Resets bypass the system, mild penalty |
+
+**Letter grades:** A (90+), B (75–89), C (60–74), D (40–59), F (<40)
+
+### Daily Reports
+
+Auto-generated when BreakTime detects a new day (or on-demand via tray menu). Includes:
+
+- **Health Score card** with letter grade and color coding
+- **Key metrics** — total breaks, prompts, completions, meeting deferrals
+- **Progress bars** — compliance rate and snooze rate
+- **Insights** — contextual tips based on your data (e.g., "High snooze rate — try taking breaks on the first prompt")
+- **Activity timeline** — chronological event log with color-coded event types
+
+### Weekly Reports
+
+Auto-generated on Monday mornings for the previous Mon–Sun week. Includes:
+
+- **Average health score** across the week
+- **Weekly summary metrics** — total breaks, prompts, compliance, active days
+- **Day-by-day breakdown** — individual scores and stats per day
+- **Trend analysis** — upward/downward/steady scoring trend
+- **Weekly insights** — meeting deferral patterns, natural break frequency
+
+### Report Files
+
+Reports are saved as self-contained HTML in `reports/`:
+
+- `daily-2026-03-09.html` — daily report
+- `weekly-2026-03-03.html` — weekly report (named by Monday of that week)
+
+Open them in any browser — they use a dark theme matching the app aesthetic with no external dependencies.
+
+---
+
 ## Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
+| **Compiled `.exe` via ps2exe** | Eliminates the PowerShell console window entirely. No risk of accidental closure or interference from other PS sessions. The app behaves like a native Windows desktop application. |
 | **Floating countdown widget** | Always visible remaining time without clicking into anything. Resets live so you always know where you stand. |
-| **3-option break prompt** | "Lock Screen & Break" is the fastest path — one click and you're up. "Take Break Now" for monitored breaks. Snooze as safety valve. |
-| **PowerShell + WPF** | Zero compilation, zero dependencies. Runs on any Windows 10/11 machine out of the box. |
+| **4-option break prompt** | "Lock Screen & Break" is the fastest path — one click and you're up. "Take Break Now" for monitored breaks. Snooze as safety valve. Reset Timer as escape hatch when you're already standing. |
+| **PowerShell + WPF** | Zero dependencies. Runs on any Windows 10/11 machine. Can be compiled to standalone `.exe` via ps2exe for console-free operation. |
 | **Inline C# via Add-Type** | Needed for Win32 P/Invoke and WASAPI COM interop. PowerShell can't do these natively. |
 | **WASAPI peak meter** | Only reliable way to detect audio playback without third-party libraries. Simpler than enumerating audio sessions. |
 | **Registry for mic/camera** | More reliable than process scanning. Works regardless of which app is using the device. |
-| **1 snooze max** | Prevent infinite snooze loops. One grace period, then mandatory. |
-| **Mandatory = no Alt+F4** | The break countdown `Closing` event is canceled unless completed. Prompt dialog also blocks dismiss when snooze was used. |
+| **Configurable snooze limit** | Default 3 snoozes prevents infinite deferral while giving reasonable flexibility. Configurable 1–5 via settings. |
+| **Mandatory = no Alt+F4** | The break countdown `Closing` event is canceled unless completed. Prompt dialog blocks dismiss when all snoozes are used — but Reset Timer is always available as an escape hatch. |
+| **Guarded DragMove** | Title bar drag only activates when left mouse button is pressed, preventing WPF freezes from right-click or edge-case mouse events. |
+| **Event-driven analytics** | Every meaningful action is logged with timestamps and context. Reports are generated passively on day/week boundaries — no user action required. |
+| **Health Score weighting** | 40% compliance + 20% break quality + 20% low-snooze + 15% sitting discipline + 5% reset penalty. Balanced to reward consistency without being punitive. |
 | **10-second tick interval** | Responsive enough for state changes. Lightweight enough to be invisible in Task Manager. |
 | **Color-coded tray icons** | Glanceable status without clicking anything. Generated via GDI+ — no icon files needed. |
 | **Post-meeting buffer** | You don't want a break overlay the instant you leave a meeting. 2-minute default lets you settle. |

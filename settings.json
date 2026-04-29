@@ -1,6 +1,7 @@
-{
-    "BreakIntervalMinutes": 45,
-    "BreakDurationMinutes": 3,
-    "PostMeetingBufferMinutes": 2,
-    "IdleThresholdMinutes": 2
+﻿{
+    "IdleThresholdMinutes":  2,
+    "BreakDurationMinutes":  3,
+    "PostMeetingBufferMinutes":  1,
+    "BreakIntervalMinutes":  30,
+    "MaxSnoozes":  3
 }
