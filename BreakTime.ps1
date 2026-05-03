@@ -524,6 +524,7 @@ function New-DailyReport {
 </html>
 "@
 
+    if (-not (Test-Path $script:ReportsDir)) { New-Item -Path $script:ReportsDir -ItemType Directory -Force | Out-Null }
     $reportPath = Join-Path $script:ReportsDir "daily-$Date.html"
     $html | Set-Content $reportPath -Encoding UTF8
     return $reportPath
@@ -679,6 +680,7 @@ function New-WeeklyReport {
 </html>
 "@
 
+    if (-not (Test-Path $script:ReportsDir)) { New-Item -Path $script:ReportsDir -ItemType Directory -Force | Out-Null }
     $reportPath = Join-Path $script:ReportsDir "weekly-$($weekStart.ToString('yyyy-MM-dd')).html"
     $html | Set-Content $reportPath -Encoding UTF8
     return $reportPath
