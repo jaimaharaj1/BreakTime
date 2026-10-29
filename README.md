@@ -16,7 +16,7 @@ Sitting for long stretches is bad for you — but traditional break reminders ar
 - **In a Teams meeting** — connected call controls are present, even when muted, camera-off or minimised. Don't interrupt.
 - **Actually idle** — no input, detected media or meeting for the full idle threshold. That's an inferred break.
 
-Sitting time is an estimate of continuous desk time, not a physical posture measurement. The reminder and widget share a live minutes-and-seconds value. Pausing freezes it; resuming preserves it. Time waiting for you to return after a reset is not counted, and clock/time-zone changes do not affect it.
+Sitting time is an estimate of continuous desk time, not a physical posture measurement. A new session starts only after fresh mouse or keyboard input following startup or a reset; background media and meetings cannot start it. The reminder and widget share a live minutes-and-seconds value. Pausing freezes it; resuming preserves it. Time waiting for you to return after a reset is not counted, and clock/time-zone changes do not affect it.
 
 ---
 
@@ -106,7 +106,7 @@ The sitting timer resets (back to 0) when any of these occur:
 
 Resuming from pause does not reset the session. Detection errors suspend automatic idle resets instead of treating unknown state as absence.
 
-### Timer Continues When
+### An Already-Started Timer Continues When
 
 - Any keyboard or mouse activity (even if you looked away briefly)
 - Media/audio is playing (watching a video, listening to music — you're still sitting)
@@ -116,7 +116,7 @@ Resuming from pause does not reset the session. Detection errors suspend automat
 
 The reminder shows `You've been sitting for 32m 15s`; the widget shows `Sitting: 32m 15s` alongside its existing countdown or status. Both use the same elapsed-time snapshot and refresh every second, including while the reminder is open. Whole seconds are displayed without rounding minutes up.
 
-- **Startup and after resets:** the value stays at zero until keyboard/mouse activity, detected media or a meeting indicates your return. Previous sessions are not restored when the app restarts.
+- **Startup and after resets:** the value stays at zero until a new mouse or keyboard input event is reported by Windows. The app records the last input timestamp at startup/reset and waits for it to change, so the click that reset the timer cannot immediately start it again. Background media, meeting detection and recently active input that preceded the reset cannot start a session. Previous sessions are not restored when the app restarts.
 - **Pause/resume:** the value freezes while paused and continues from the same value after resuming. Paused time is not added later.
 - **Snooze and meetings:** sitting time continues; deferring a reminder does not reset or pause the sitting session.
 - **Inactivity:** an automatic reset requires the full configured idle threshold since the last input, detected audio or meeting-presence signal. Keyboard/mouse inactivity alone is not enough during a detected meeting or playback.
@@ -208,7 +208,7 @@ Double-click **Start-BreakTime.bat**, or run directly:
 powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "BreakTime.ps1"
 ```
 
-A tray icon and a small widget appear in the top-left corner. The widget can briefly show `CHECKING` while the first Teams scan completes. Sitting time begins when input, media or a meeting is detected.
+A tray icon and a small widget appear in the top-left corner. The widget shows `Ready` until fresh mouse or keyboard input starts the sitting session. It can then briefly show `CHECKING` while the first Teams scan completes.
 
 ### Countdown Widget
 
@@ -220,13 +220,15 @@ The main widget display retains its countdown or status:
 |-------------|--------|
 | Normal | `32:15` in blue — minutes:seconds until next break |
 | Break soon (< 5 min) | `4:30` in orange with "break soon" |
-| Break overdue | `BREAK!` in red with "X min overdue" |
+| Break due | `BREAK!` in red with "Time to move"; the separate sitting line remains the total elapsed time |
 | On break | `On Break!` in green with ☕ icon and "stretch & walk around" |
 | Paused | `PAUSED` in gray |
 | In meeting | `MEETING` in blue with "break deferred" |
 | Snoozed | `2:15` in orange with "snooze left" |
 
-`Ready` means the timer is waiting for activity after startup or a reset. `CHECKING` means Teams detection is pending or unavailable; automatic reminders are held while that state persists. `MEETING` appears when a break is due and has been deferred, not necessarily throughout every meeting.
+`Ready` displays "waiting for mouse/keyboard" after startup or a reset. The sitting value remains zero until fresh input is reported. `CHECKING` means Teams detection is pending or unavailable; automatic reminders are held while that state persists. `MEETING` appears when a break is due and has been deferred, not necessarily throughout every meeting.
+
+The widget no longer displays a numeric overdue counter. "Time to move" is an action reminder, while `Sitting: Xm YYs` matches the reminder window's total sitting time, including time spent in a meeting.
 
 - **Drag** anywhere on screen by clicking and dragging the title bar or content area
 - **Minimize** (—) or **Close** (✕) buttons hide the widget; timer continues in the background
@@ -336,7 +338,7 @@ Uses Windows Audio Session API (WASAPI) via COM interop:
 3. **Activate** `IAudioMeterInformation` on each device
 4. **Read** `GetPeakValue()` — returns a float 0.0 to 1.0 — and release COM objects after sampling
 
-Audio is sampled each second. If any endpoint reports a peak above 0.0001, playback is detected. A 30-second recent-media window bridges short gaps and can recognise your return after a reset. Natural-break detection additionally requires the entire configured idle threshold without input, detected media or meeting presence, rather than resetting as soon as the recent-media window expires.
+Audio is sampled each second. If any endpoint reports a peak above 0.0001, playback is detected. A 30-second recent-media window bridges short gaps during an already-started sitting session; it does not start a new session after a reset. Natural-break detection additionally requires the entire configured idle threshold without input, detected media or meeting presence, rather than resetting as soon as the recent-media window expires.
 
 Media is a presence signal, not a meeting signal: watching a recording or YouTube keeps sitting time running and still allows a due break reminder. An audio-detection failure raises a warning and suspends automatic idle resets instead of being treated as silence.
 
@@ -380,6 +382,7 @@ Media is a presence signal, not a meeting signal: watching a recording or YouTub
 ## Known Limitations
 
 - **No posture sensor:** "sitting" means estimated continuous desk time. Standing at the desk or leaving audio playing while away cannot be distinguished reliably; use Pause, Reset Timer or Break Already Taken when appropriate.
+- **Windows-reported input:** the fresh-input gate uses `GetLastInputInfo`, not a physical-presence sensor. Software-generated keyboard or mouse events can also be reported by Windows. Only the input timestamp is read, not keystrokes or their contents.
 - **Silent media:** completely silent videos, or audio activity below the detection threshold for the full idle interval, can look like inactivity. Muting does not guarantee either outcome because the Windows peak meter depends on the playback path. Pause tracking when watching content that is not detected.
 - **Teams compatibility:** fixed accessibility IDs may change in a future Teams release. The detector is designed for the desktop `ms-teams`/`Teams` processes; Teams in a browser is not covered by this call-control detector.
 - **Other meeting apps:** legacy microphone/camera and title heuristics can produce false positives or negatives. They are not equivalent to the Teams connected-call check.
@@ -393,7 +396,7 @@ From the app directory, run the existing Pester suite in Windows PowerShell with
 powershell.exe -STA -NoProfile -Command "Invoke-Pester -Script '.\tests\BreakTime.Tests.ps1' -EnableExit"
 ```
 
-The suite uses Pester (validated with the installed version 3.4.0); Pester is a development/test dependency, not an app runtime dependency. The 29 October 2026 update passed 36 checks covering elapsed-time accuracy, pause/reset/waiting behaviour, meeting and playback handling, lock/sleep, call-end grace, background scan failures/timeouts, shared live displays, queued reminders, window markup and synthetic call-control fixtures.
+The suite uses Pester (validated with the installed version 3.4.0); Pester is a development/test dependency, not an app runtime dependency. It covers elapsed-time accuracy, fresh-input gating after startup/reset, background media and meeting activity while waiting, input timestamp rollover, pause/resume, meeting and playback handling once tracking starts, lock/sleep, call-end grace, background scan failures/timeouts, shared live displays, widget messages, queued reminders, window markup and synthetic call-control fixtures.
 
 Synthetic accessibility fixtures do not access real Teams meeting content. The suite does not launch the BreakTime entry point or modify your settings, but briefly creates non-activating off-screen test windows.
 

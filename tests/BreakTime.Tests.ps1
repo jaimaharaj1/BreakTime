@@ -32,6 +32,7 @@ foreach ($name in @('sessionSwitchHandler', 'powerModeHandler')) {
 function Initialize-TestState {
     $script:Now = 1000.0
     $script:Idle = 0.0
+    $script:InputTick = [uint32]100
     $script:Settings = @{
         BreakIntervalMinutes = 30; IdleThresholdMinutes = 3
         PostMeetingBufferMinutes = 2; MaxSnoozes = 3; BreakDurationMinutes = 3
@@ -39,7 +40,7 @@ function Initialize-TestState {
     $script:SittingElapsedSeconds = 0.0
     $script:SittingResumedAt = $null
     $script:WaitingForActivity = $true
-    $script:WaitingSince = $script:Now
+    $script:WaitingForInputTick = $script:InputTick
     $script:LastPresenceAt = $null
     $script:Paused = $false
     $script:ScreenLocked = $false
@@ -73,15 +74,18 @@ Describe 'Continuous desk-time tracking' {
         Initialize-TestState
         Mock Get-TrackingSeconds { $script:Now }
         Mock Get-IdleSeconds { $script:Idle }
+        Mock Get-LastInputTick { $script:InputTick }
         Mock Update-MeetingActivity {}
         Mock Update-MediaActivity {}
         Mock Update-SittingDisplays {}
         Mock Update-Widget {}
         Mock Update-TrayIcon {}
         Mock Request-BreakPrompt {}
+        $script:InputTick++
     }
 
     It 'does not count startup or time waiting to return after a reset' {
+        $script:InputTick = $script:WaitingForInputTick
         $script:Now += 600
         $script:Idle = 900
         Invoke-TrackingTick
@@ -95,22 +99,92 @@ Describe 'Continuous desk-time tracking' {
         Get-SittingSeconds | Should Be 12.75
     }
 
-    It 'starts from media without requiring keyboard or mouse activity' {
+    It 'waits for new input despite fifteen minutes of background media' {
+        Invoke-TrackingTick
+        Reset-SittingTimer
         $script:Idle = 900
         $script:LastMediaDetectedAt = $script:Now
         Invoke-TrackingTick
-        $script:Now += 20
-        Get-SittingSeconds | Should Be 20
+        $script:Now += 900
+        $script:LastMediaDetectedAt = $script:Now
+        Invoke-TrackingTick
+        Get-SittingSeconds | Should Be 0
+        $script:WaitingForActivity | Should Be $true
+        Assert-MockCalled Request-BreakPrompt -Times 0 -Scope It
     }
 
-    It 'starts from a muted call without keyboard activity' {
+    It 'waits for new input despite a detected meeting' {
+        $script:InputTick = $script:WaitingForInputTick
         $script:Idle = 900
         $script:TeamsInCall = $true
         Invoke-TrackingTick
-        $script:Now += 300
+        $script:Now += 900
         Invoke-TrackingTick
-        Get-SittingSeconds | Should Be 300
+        Get-SittingSeconds | Should Be 0
+        $script:WaitingForActivity | Should Be $true
+    }
+
+    It 'does not reuse the recent click that reset the timer' {
+        Invoke-TrackingTick
+        Reset-SittingTimer
+        $script:Now += 0.5
+        $script:Idle = 0.5
+        Invoke-TrackingTick
+        $script:Now += 900
+        $script:Idle += 900
+        Invoke-TrackingTick
+        Get-SittingSeconds | Should Be 0
+        $script:WaitingForActivity | Should Be $true
+    }
+
+    It 'starts after fresh input even when background media is present' {
+        Reset-SittingTimer
+        $script:Now += 900
+        $script:LastMediaDetectedAt = $script:Now
+        $script:InputTick++
+        Invoke-TrackingTick
+        $script:Now += 20
+        Get-SittingSeconds | Should Be 20
         $script:WaitingForActivity | Should Be $false
+    }
+
+    It 'recognises input between heartbeats even if it is no longer recent' {
+        Reset-SittingTimer
+        $script:Now += 10
+        $script:Idle = 3
+        $script:InputTick++
+        Invoke-TrackingTick
+        $script:WaitingForActivity | Should Be $false
+        $script:Now += 5
+        Get-SittingSeconds | Should Be 5
+    }
+
+    It 'recognises a changed input timestamp across the 32-bit tick rollover' {
+        $script:InputTick = [uint32]::MaxValue
+        Reset-SittingTimer
+        $script:InputTick = [uint32]0
+        Invoke-TrackingTick
+        $script:WaitingForActivity | Should Be $false
+    }
+
+    It 'keeps waiting if the input timestamp cannot be read' {
+        Mock Get-LastInputTick { throw 'Input detection unavailable' }
+        { Invoke-TrackingTick } | Should Throw
+        $script:WaitingForActivity | Should Be $true
+        Get-SittingSeconds | Should Be 0
+    }
+
+    It 'does not start a waiting session from meeting or media activity while locked' {
+        $script:InputTick = $script:WaitingForInputTick
+        $script:ScreenLocked = $true
+        $script:TeamsInCall = $true
+        $script:LastMediaDetectedAt = $script:Now
+        Invoke-TrackingTick
+        $script:Now += 900
+        $script:LastMediaDetectedAt = $script:Now
+        Invoke-TrackingTick
+        Get-SittingSeconds | Should Be 0
+        $script:WaitingForActivity | Should Be $true
     }
 
     It 'freezes while paused and continues from the same elapsed value' {
@@ -132,6 +206,7 @@ Describe 'Continuous desk-time tracking' {
         Toggle-Pause
         $script:Now += 10
         Get-SittingSeconds | Should Be 0
+        $script:InputTick++
         Invoke-TrackingTick
         $script:Now += 5
         Get-SittingSeconds | Should Be 5
@@ -340,6 +415,39 @@ Describe 'Shared live sitting displays' {
         $script:SittingElapsedSeconds = 126.2
         Update-SittingDisplays
         $text.Text | Should Be "You've been sitting for 2m 06s"
+    }
+}
+
+Describe 'Widget break and waiting messages' {
+    BeforeEach {
+        Initialize-TestState
+        $controls = @{}
+        foreach ($name in @('WidgetTime', 'WidgetStatus', 'WidgetIcon', 'WidgetBorder', 'WidgetSitting')) {
+            $controls[$name] = [pscustomobject]@{
+                Text = ''; FontSize = 0; Foreground = $null; BorderBrush = $null
+            }
+        }
+        $script:Widget = [pscustomobject]@{ IsLoaded = $true; Controls = $controls }
+        $script:Widget | Add-Member ScriptMethod FindName { param($name) return $this.Controls[$name] }
+    }
+
+    AfterEach {
+        $script:Widget = $null
+    }
+
+    It 'shows Time to move with the total sitting duration instead of an overdue counter' {
+        $script:WaitingForActivity = $false
+        Update-Widget -SittingSeconds 5427
+        $script:Widget.Controls.WidgetTime.Text | Should Be 'BREAK!'
+        $script:Widget.Controls.WidgetStatus.Text | Should Be 'Time to move'
+        $script:Widget.Controls.WidgetSitting.Text | Should Be 'Sitting: 90m 27s'
+    }
+
+    It 'makes clear that a reset session is waiting for mouse or keyboard input' {
+        Update-Widget -SittingSeconds 0
+        $script:Widget.Controls.WidgetTime.Text | Should Be 'Ready'
+        $script:Widget.Controls.WidgetStatus.Text | Should Be 'waiting for mouse/keyboard'
+        $script:Widget.Controls.WidgetSitting.Text | Should Be 'Sitting: 0m 00s'
     }
 }
 

@@ -90,13 +90,19 @@ public static class NativeMethods
         return GetTickCount64() / 1000.0;
     }
 
-    // Returns seconds since last keyboard/mouse input
-    public static double GetIdleSeconds()
+    public static uint GetLastInputTick()
     {
         LASTINPUTINFO lii = new LASTINPUTINFO();
         lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
         if (!GetLastInputInfo(ref lii)) throw new Win32Exception();
-        return unchecked((uint)Environment.TickCount - lii.dwTime) / 1000.0;
+        return lii.dwTime;
+    }
+
+    // Returns seconds since last keyboard/mouse input
+    public static double GetIdleSeconds()
+    {
+        uint lastInputTick = GetLastInputTick();
+        return unchecked((uint)Environment.TickCount - lastInputTick) / 1000.0;
     }
 
     public static void HideConsole()
@@ -313,7 +319,7 @@ $script:OnBreak             = $false               # True while break countdown 
 $script:BreakEndTime        = $null                # When the current break countdown ends
 $script:BreakPaused         = $false               # True when idle-gated break is paused (user active; used by countdown timer closure)
 $script:BreakRemaining      = 0                    # Seconds remaining in break (used by countdown timer closure)
-$script:WaitingForActivity  = $true                # Start only when input, media or a call is observed
+$script:WaitingForActivity  = $true                # Start only after a new mouse/keyboard input event
 $script:LastPresenceAt      = $null
 $script:TeamsScanTask       = $null
 $script:TeamsScanStartedAt  = $null
@@ -327,7 +333,7 @@ $script:AudioDetectionFailed = $false
 $script:SystemSuspendedAt  = $null
 $script:PromptWindow       = $null
 $script:OtherMeetingActive = $false
-$script:WaitingSince       = [NativeMethods]::GetMonotonicSeconds()
+$script:WaitingForInputTick = [NativeMethods]::GetLastInputTick()
 $script:PromptPending      = $false
 $script:LockedPresence     = $false
 $script:TrackingWarning    = $false
@@ -458,6 +464,10 @@ function Get-IdleSeconds {
     return [NativeMethods]::GetIdleSeconds()
 }
 
+function Get-LastInputTick {
+    return [NativeMethods]::GetLastInputTick()
+}
+
 function Show-DetectionWarning {
     param([string]$Message)
     if ($script:TrayIcon) {
@@ -570,6 +580,7 @@ function Resume-SittingTimer {
 
 function Reset-SittingTimer {
     # Resets all tracking state — called after breaks, screen unlock, or manual reset.
+    $inputTick = Get-LastInputTick
     $script:SittingElapsedSeconds = 0.0
     $script:SittingResumedAt = $null
     $script:State = 'Tracking'
@@ -578,7 +589,7 @@ function Reset-SittingTimer {
     $script:MeetingEndedAt = $null
     $script:LastMediaDetectedAt = $null
     $script:WaitingForActivity = $true
-    $script:WaitingSince = Get-TrackingSeconds
+    $script:WaitingForInputTick = $inputTick
     $script:LastPresenceAt = $null
     Update-TrayIcon
     Update-Widget
@@ -829,7 +840,7 @@ function Update-Widget {
         $widgetTime.Text = "Ready"
         $widgetTime.FontSize = 24
         $widgetTime.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
-        $widgetStatus.Text = "waiting for activity"
+        $widgetStatus.Text = "waiting for mouse/keyboard"
         $widgetIcon.Text = [char]0x2705  # ✅
         $widgetIcon.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
         $widgetBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#66BB6A')
@@ -885,11 +896,10 @@ function Update-Widget {
     }
 
     if ($remainMinutes -le 0) {
-        $overdue = [int][Math]::Floor([Math]::Abs($remainMinutes))
         $widgetTime.Text = "BREAK!"
         $widgetTime.FontSize = 24
         $widgetTime.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#F44336')
-        $widgetStatus.Text = "$overdue min overdue"
+        $widgetStatus.Text = "Time to move"
         $widgetIcon.Text = [char]0x26A0  # ⚠
         $widgetIcon.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#F44336')
         $widgetBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#F44336')
@@ -1665,10 +1675,10 @@ function Invoke-TrackingTick {
 
     $idleSeconds = Get-IdleSeconds
     $lastInputAt = $now - $idleSeconds
-    $hasPresence = $inMeeting -or $hasMedia -or $idleSeconds -lt 2 -or $lastInputAt -gt $script:WaitingSince
 
     if ($script:WaitingForActivity) {
-        if ($hasPresence) {
+        # Compare the input event itself: recent pre-reset input and background activity are not a return.
+        if ((Get-LastInputTick) -ne $script:WaitingForInputTick) {
             $script:WaitingForActivity = $false
             $script:LastPresenceAt = $now
             Resume-SittingTimer
